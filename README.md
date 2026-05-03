@@ -46,8 +46,9 @@ cp bridge.au3 ~/.wine/drive_c/AutoIt3/bridge.au3
 
 ### 3. Register the MCP server
 
-Add to your MCP client config (e.g. `~/.kiro/settings/mcp.json` for Kiro, or `claude_desktop_config.json` for Claude Desktop):
+Add to your MCP client config:
 
+**Kiro** (`~/.kiro/settings/mcp.json`):
 ```json
 {
   "mcpServers": {
@@ -61,6 +62,41 @@ Add to your MCP client config (e.g. `~/.kiro/settings/mcp.json` for Kiro, or `cl
     }
   }
 }
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "wine-autoit-bridge": {
+      "command": "uv",
+      "args": ["run", "--script", "/path/to/server.py"],
+      "env": {
+        "WINEPREFIX": "/Users/you/.wine",
+        "WINEDEBUG": "-all"
+      }
+    }
+  }
+}
+```
+
+### 4. (Kiro only) Install the skill and agent
+
+Copy the skill so Kiro loads it automatically when working with Wine apps:
+
+```bash
+# Skill — loaded automatically based on context
+mkdir -p ~/.kiro/skills/wine-autoit-mcp
+cp SKILL.md ~/.kiro/skills/wine-autoit-mcp/SKILL.md
+
+# Agent — available as a named agent in Kiro
+mkdir -p ~/.kiro/agents
+cp .kiro/agents/wine-autoit.md ~/.kiro/agents/wine-autoit.md
+```
+
+Then in Kiro you can invoke it directly:
+```
+agent: wine-autoit  automate the login flow for my app
 ```
 
 ## MCP Tools
