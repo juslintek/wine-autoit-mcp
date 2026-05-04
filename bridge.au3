@@ -29,7 +29,7 @@ While 1
 WEnd
 
 Func ExecuteCommand($sJson)
-    ; Simple pipe-delimited parsing (action|param1|param2)
+    ; Pipe-delimited: action|param1|param2
     Local $aParts = StringSplit($sJson, "|")
     If $aParts[0] < 1 Then Return '{"error":"empty command"}'
 
@@ -48,12 +48,45 @@ Func ExecuteCommand($sJson)
             For $i = 1 To $aList[0][0]
                 If $aList[$i][0] <> "" And BitAND(WinGetState($aList[$i][1]), 2) Then
                     If $nCount > 0 Then $sResult &= ","
-                    $sResult &= '{"title":"' & StringReplace($aList[$i][0], '"', '\"') & '","hwnd":' & $aList[$i][1] & '}'
+                    $sResult &= '{"title":"' & StringReplace($aList[$i][0], '"', '\"') & '","hwnd":' & Dec(Hex($aList[$i][1])) & '}'
                     $nCount += 1
                 EndIf
             Next
             $sResult &= ']}'
             Return $sResult
+
+        Case "wintitle"
+            If $aParts[0] >= 2 Then
+                Local $sTitle = WinGetTitle(HWnd($aParts[2]))
+                Return '{"title":"' & StringReplace($sTitle, '"', '\"') & '"}'
+            EndIf
+            Return '{"error":"need hwnd"}'
+
+        Case "activate"
+            If $aParts[0] >= 2 Then
+                WinActivate(HWnd($aParts[2]))
+                WinWaitActive(HWnd($aParts[2]), "", 2)
+                Return '{"ok":true}'
+            EndIf
+            Return '{"error":"need hwnd"}'
+
+        Case "winpos"
+            If $aParts[0] >= 2 Then
+                Local $hWnd = HWnd($aParts[2])
+                Local $aPos = WinGetPos($hWnd)
+                If IsArray($aPos) Then
+                    Return '{"x":' & $aPos[0] & ',"y":' & $aPos[1] & ',"w":' & $aPos[2] & ',"h":' & $aPos[3] & '}'
+                EndIf
+                Return '{"error":"window not found"}'
+            EndIf
+            Return '{"error":"need hwnd"}'
+
+        Case "clickpos"
+            If $aParts[0] >= 3 Then
+                MouseClick("left", Int($aParts[2]), Int($aParts[3]))
+                Return '{"ok":true}'
+            EndIf
+            Return '{"error":"need x y"}'
 
         Case "click"
             If $aParts[0] >= 2 Then
@@ -98,6 +131,18 @@ Func ExecuteCommand($sJson)
                 Return $sResult
             EndIf
             Return '{"error":"need hwnd"}'
+
+        Case "sendtowindow"
+            If $aParts[0] >= 3 Then
+                Local $hWnd = HWnd($aParts[2])
+                WinActivate($hWnd)
+                If WinWaitActive($hWnd, "", 3) Then
+                    Send($aParts[3])
+                    Return '{"ok":true}'
+                EndIf
+                Return '{"error":"window did not become active"}'
+            EndIf
+            Return '{"error":"need hwnd and keys"}'
 
         Case "key"
             If $aParts[0] >= 2 Then

@@ -51,6 +51,27 @@ def _bridge_running() -> bool:
     return STATUS_FILE.exists() and STATUS_FILE.read_text().strip() == "ready"
 
 
+def _macos_window_id(title_substring: str) -> str | None:
+    """Find macOS window ID by title substring using Swift CGWindowList."""
+    swift = f'''
+import CoreGraphics
+import Foundation
+let opts = CGWindowListOption([.optionOnScreenOnly, .excludeDesktopElements])
+if let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String:Any]] {{
+    for w in list {{
+        let name = w["kCGWindowName"] as? String ?? ""
+        let wid = w["kCGWindowNumber"] as? Int ?? 0
+        if name.contains({json.dumps(title_substring)}) {{
+            print(wid)
+            break
+        }}
+    }}
+}}
+'''
+    r = subprocess.run(["swift", "-"], input=swift, capture_output=True, text=True)
+    return r.stdout.strip() or None
+
+
 @mcp.tool()
 def bridge_start() -> dict:
     """Start the AutoIt3 bridge inside Wine. Idempotent — safe to call if already running."""
@@ -91,12 +112,43 @@ def windows_list() -> dict:
 
 
 @mcp.tool()
-def screenshot(window_hwnd: str = "") -> dict:
-    """
-    Capture a screenshot. Returns the file path of the saved PNG.
-    window_hwnd: optional HWND (not yet supported — captures full screen).
-    """
+def screenshot() -> dict:
+    """Capture a full-screen screenshot inside Wine. Returns file path."""
     return _send("screenshot")
+
+
+@mcp.tool()
+def screenshot_window(hwnd: str) -> dict:
+    """
+    Capture a screenshot of a specific Wine window by HWND, without needing it in front.
+    Uses macOS screencapture -l with Swift CGWindowList to find the window by title.
+    hwnd: window handle (integer as string, from windows_list).
+    """
+    result = _send(f"wintitle|{hwnd}")
+    title = result.get("title", "")
+    if not title:
+        return {"error": "could not get window title"}
+    wid = _macos_window_id(title)
+    if not wid:
+        return {"error": f"macOS window not found for title: {title}"}
+    out = str(BRIDGE_DIR / f"screenshots/mac_{int(time.time())}.png")
+    subprocess.run(["screencapture", "-l", wid, out], check=True)
+    return {"ok": True, "file": out}
+
+
+@mcp.tool()
+def screenshot_by_title(title_substring: str) -> dict:
+    """
+    Capture a screenshot of a Wine window matching a title substring.
+    Works without the window being in front (macOS screencapture -l).
+    title_substring: partial window title, e.g. 'Gotas SQL' or 'Program Error'.
+    """
+    wid = _macos_window_id(title_substring)
+    if not wid:
+        return {"error": f"no window found matching: {title_substring}"}
+    out = str(BRIDGE_DIR / f"screenshots/mac_{int(time.time())}.png")
+    subprocess.run(["screencapture", "-l", wid, out], check=True)
+    return {"ok": True, "file": out, "window_id": wid}
 
 
 @mcp.tool()
@@ -144,6 +196,34 @@ def send_key(key: str) -> dict:
     Examples: '{ENTER}', '{TAB}', '{ESC}', 'Hello{ENTER}', '!{F4}'.
     """
     return _send(f"key|{key}")
+
+
+@mcp.tool()
+def send_to_window(hwnd: str, keys: str) -> dict:
+    """
+    Activate a window and send keystrokes to it atomically.
+    Waits for the window to have focus before sending.
+    hwnd: window handle. keys: AutoIt Send() syntax.
+    """
+    return _send(f"sendtowindow|{hwnd}|{keys}")
+
+
+@mcp.tool()
+def window_activate(hwnd: str) -> dict:
+    """Bring a window to the foreground."""
+    return _send(f"activate|{hwnd}")
+
+
+@mcp.tool()
+def window_pos(hwnd: str) -> dict:
+    """Get position and size of a window: {x, y, w, h}."""
+    return _send(f"winpos|{hwnd}")
+
+
+@mcp.tool()
+def click_pos(x: int, y: int) -> dict:
+    """Click at screen coordinates (Wine coordinate space)."""
+    return _send(f"clickpos|{x}|{y}")
 
 
 @mcp.tool()
