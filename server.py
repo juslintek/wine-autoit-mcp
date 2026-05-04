@@ -15,6 +15,11 @@ Screenshot approach:
     wine explorer /desktop=gotas,1024x768 gotassql.exe
     wine explorer /desktop=gotas,1024x768 AutoIt3.exe bridge.au3
 - screenshot_by_title: macOS-only fallback using screencapture -l <windowID>
+
+Input injection:
+- sendinput.exe: compiled C program using Win32 SendInput API
+- Works cross-process, uses SetForegroundWindow + SendInput with proper scan codes
+- Compile: i686-w64-mingw32-gcc -O2 -o sendinput.exe sendinput.c -luser32
 """
 
 import os
@@ -33,7 +38,7 @@ STATUS_FILE = BRIDGE_DIR / "status.txt"
 AUTOIT_EXE = "C:\\AutoIt3\\AutoIt3.exe"
 BRIDGE_SCRIPT = "C:\\AutoIt3\\bridge.au3"
 WINE = os.environ.get("WINE", "/opt/homebrew/bin/wine")
-DESKTOP = os.environ.get("WINE_DESKTOP", "gotas")  # virtual desktop name
+DESKTOP = os.environ.get("WINE_DESKTOP", "gotas")
 
 mcp = FastMCP("wine-autoit-bridge")
 
@@ -51,7 +56,7 @@ def _send(command: str, timeout: float = 10.0) -> dict:
                     return json.loads(raw)
                 except json.JSONDecodeError:
                     return {"raw": raw}
-        time.sleep(0.02)  # 20ms — matches bridge poll interval
+        time.sleep(0.02)
     return {"error": f"timeout after {timeout}s waiting for result"}
 
 
@@ -60,7 +65,6 @@ def _bridge_running() -> bool:
 
 
 def _wine_run(*args: str) -> subprocess.Popen:
-    """Launch a Wine process inside the named virtual desktop."""
     env = {**os.environ, "WINEPREFIX": WINEPREFIX, "WINEDEBUG": "-all"}
     return subprocess.Popen(
         [WINE, "explorer", f"/desktop={DESKTOP},1024x768", *args],
@@ -68,18 +72,45 @@ def _wine_run(*args: str) -> subprocess.Popen:
     )
 
 
+def _screenshot_macos() -> dict | None:
+    """macOS fallback: find largest Wine window and capture via screencapture -l."""
+    import platform
+    if platform.system() != "Darwin":
+        return None
+    swift = """
+import CoreGraphics, Foundation
+let opts = CGWindowListOption([.optionOnScreenOnly, .excludeDesktopElements])
+guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { exit(1) }
+var best = (wid: 0, area: 0)
+for w in list {
+    guard (w["kCGWindowOwnerName"] as? String) == "wine" else { continue }
+    let b = w["kCGWindowBounds"] as? [String: Any] ?? [:]
+    let area = (b["Width"] as? Int ?? 0) * (b["Height"] as? Int ?? 0)
+    let wid = w["kCGWindowNumber"] as? Int ?? 0
+    if area > best.area { best = (wid, area) }
+}
+if best.wid > 0 { print(best.wid) }
+"""
+    try:
+        r = subprocess.run(["swift", "-"], input=swift, capture_output=True, text=True, timeout=8)
+        wid = r.stdout.strip()
+        if not wid:
+            return None
+        out = str(BRIDGE_DIR / f"screenshots/mac_{int(time.time())}.png")
+        subprocess.run(["screencapture", "-x", "-l", wid, out], check=True, timeout=5)
+        return {"ok": True, "file": out, "source": "macos_fallback"}
+    except Exception:
+        return None
+
+
 @mcp.tool()
 def bridge_start() -> dict:
-    """
-    Start the AutoIt3 bridge inside Wine virtual desktop.
-    Both bridge and app must share the same desktop name (default: 'gotas').
-    Idempotent — safe to call if already running.
-    """
+    """Start the AutoIt3 bridge inside Wine virtual desktop. Idempotent."""
     if _bridge_running():
         return {"ok": True, "status": "already running"}
     STATUS_FILE.unlink(missing_ok=True)
     _wine_run(AUTOIT_EXE, BRIDGE_SCRIPT)
-    for _ in range(250):  # wait up to 5s
+    for _ in range(250):
         if _bridge_running():
             return {"ok": True, "status": "started"}
         time.sleep(0.02)
@@ -95,77 +126,38 @@ def bridge_stop() -> dict:
 @mcp.tool()
 def bridge_status() -> dict:
     """Check if the AutoIt3 bridge is running."""
-    running = _bridge_running()
-    return {"running": running, "status": STATUS_FILE.read_text().strip() if STATUS_FILE.exists() else "not found"}
+    return {"running": _bridge_running(), "status": STATUS_FILE.read_text().strip() if STATUS_FILE.exists() else "not found"}
 
 
 @mcp.tool()
 def windows_list() -> dict:
-    """List all visible windows in the Wine virtual desktop."""
+    """List all visible windows in the Wine session."""
     return _send("windows")
 
 
 @mcp.tool()
 def screenshot() -> dict:
     """
-    Capture a screenshot of the Wine virtual desktop.
-    Requires bridge and app to share the same virtual desktop (explorer /desktop=gotas).
-    Returns the file path of the saved PNG inside the Wine prefix.
+    Capture a screenshot. Tries AutoIt _ScreenCapture_Capture first (works in virtual desktop).
+    Falls back to macOS screencapture -l if result is black (<5KB).
     """
     result = _send("screenshot")
-    # Check if bridge screenshot is black (small file = black on macOS Wine)
-    if isinstance(result, dict) and result.get("ok"):
-        wine_path = result.get("file", "")
-        unix_path = os.path.join(WINEPREFIX, "drive_c", wine_path.replace("C:\\", "").replace("\\", "/"))
-        if os.path.exists(unix_path) and os.path.getsize(unix_path) < 10000:
-            # Likely black — use macOS native capture as fallback
-            host_result = _screenshot_host()
-            if host_result:
-                return host_result
+    if not (isinstance(result, dict) and result.get("ok")):
+        return result
+    wine_path = result.get("file", "")
+    unix_path = Path(WINEPREFIX) / "drive_c" / wine_path.replace("C:\\", "").replace("\\", "/")
+    if unix_path.exists() and unix_path.stat().st_size < 5000:
+        fallback = _screenshot_macos()
+        if fallback:
+            return fallback
     return result
-
-
-def _screenshot_host() -> dict | None:
-    """Fallback: capture Wine window via macOS screencapture -l."""
-    import platform
-    if platform.system() != "Darwin":
-        return None
-    try:
-        # Find Wine window ID
-        find_cmd = """swift -e '
-let windows = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as! [[String: Any]]
-var best = 0; var bestH = 0
-for w in windows {
-    let owner = w["kCGWindowOwnerName"] as? String ?? ""
-    if owner == "wine" {
-        let bounds = w["kCGWindowBounds"] as? [String:Any] ?? [:]
-        let h = bounds["Height"] as? Int ?? 0
-        if h > bestH { bestH = h; best = w["kCGWindowNumber"] as? Int ?? 0 }
-    }
-}
-print(best)
-'"""
-        wid = subprocess.run(find_cmd, shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
-        if not wid or wid == "0":
-            return None
-        ts = time.strftime("%H%M%S")
-        out_path = os.path.join(BRIDGE_DIR, "screenshots", f"capture_{ts}.png")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        subprocess.run(["screencapture", "-l", wid, "-x", out_path], timeout=5)
-        if os.path.exists(out_path):
-            win_path = f"C:\\AutoIt3\\bridge\\screenshots\\capture_{ts}.png"
-            return {"ok": True, "file": win_path}
-    except Exception:
-        pass
-    return None
 
 
 @mcp.tool()
 def screenshot_by_title(title_substring: str) -> dict:
     """
     macOS-only: capture a Wine window by title substring using screencapture -l.
-    Works without the window being in front. Does NOT require virtual desktop.
-    title_substring: partial window title, e.g. 'Gotas SQL'.
+    Works without the window being in front.
     """
     swift = f'''
 import CoreGraphics,Foundation
@@ -183,44 +175,79 @@ if let l=CGWindowListCopyWindowInfo(opts,kCGNullWindowID) as? [[String:Any]] {{
     if not wid:
         return {"error": f"no window found matching: {title_substring}"}
     out = str(BRIDGE_DIR / f"screenshots/mac_{int(time.time())}.png")
-    subprocess.run(["screencapture", "-l", wid, out], check=True)
+    subprocess.run(["screencapture", "-x", "-l", wid, out], check=True)
     return {"ok": True, "file": out, "window_id": wid}
+
+
+@mcp.tool()
+def sendinput(hwnd: str, action: str, value: str = "") -> dict:
+    """
+    Inject keyboard input into a Wine window using SendInput (via sendinput.exe).
+    Works cross-process, brings window to foreground.
+    hwnd: target window handle (decimal, from windows_list).
+    action: one of 'text', 'tab', 'enter', 'clear', 'vk'.
+    value: text to type (for 'text'), or VK code string (for 'vk').
+    """
+    exe = Path(WINEPREFIX) / "drive_c/AutoIt3/sendinput.exe"
+    if not exe.exists():
+        return {"error": "sendinput.exe not found — copy it to C:\\AutoIt3\\sendinput.exe"}
+    env = {**os.environ, "WINEPREFIX": WINEPREFIX, "WINEDEBUG": "-all"}
+    args = [WINE, "C:\\AutoIt3\\sendinput.exe", hwnd]
+    if action == "text":
+        args.append(value)
+    elif action == "tab":
+        args.append("--tab")
+    elif action == "enter":
+        args.append("--enter")
+    elif action == "clear":
+        args.append("--clear")
+    elif action == "vk":
+        args.extend(["--vk", value])
+    else:
+        return {"error": f"unknown action: {action}. Use text/tab/enter/clear/vk"}
+    subprocess.run(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    return {"ok": True}
 
 
 @mcp.tool()
 def login(hwnd: str, user_id: str, password: str) -> dict:
     """
-    Fill and submit the GotasSQL login form.
-    Uses PostMessage WM_CHAR to child HWNDs — no WinActivate, no mouse movement.
-    hwnd: login window handle (from windows_list).
-    user_id: operator ID string, e.g. '1'.
-    password: plaintext password (e.g. '1').
+    Fill and submit login form using sendinput.exe.
+    Assumes focus starts on user ID field (pre-filled). Tabs to password, types, submits.
+    hwnd: login window handle. user_id: operator ID. password: plaintext password.
     """
-    return _send(f"login|{hwnd}|{user_id}|{password}", timeout=10.0)
+    exe = Path(WINEPREFIX) / "drive_c/AutoIt3/sendinput.exe"
+    if not exe.exists():
+        return {"error": "sendinput.exe not found"}
+    env = {**os.environ, "WINEPREFIX": WINEPREFIX, "WINEDEBUG": "-all"}
+    def si(*a):
+        subprocess.run([WINE, "C:\\AutoIt3\\sendinput.exe", hwnd, *a],
+                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        time.sleep(0.3)
+    si("--clear")
+    si(user_id)
+    si("--tab")
+    si(password)
+    si("--enter")
+    return {"ok": True}
 
 
 @mcp.tool()
 def window_children(hwnd: str) -> dict:
-    """List direct child window HWNDs of a window."""
+    """List direct child window HWNDs."""
     return _send(f"children|{hwnd}")
 
 
 @mcp.tool()
 def window_tree(hwnd: str) -> dict:
-    """List all controls inside a window by Win32 class/instance."""
+    """List all controls by Win32 class/instance."""
     return _send(f"tree|{hwnd}")
 
 
 @mcp.tool()
 def control_get_text(hwnd: str, control_id: str) -> dict:
-    """Read text from a control. control_id: e.g. '[CLASS:Edit; INSTANCE:1]'."""
+    """Read text from a control."""
     return _send(f"gettext|{hwnd}|{control_id}")
-
-
-@mcp.tool()
-def control_set_text(hwnd: str, control_id: str, text: str) -> dict:
-    """Set text in a control via WM_SETTEXT."""
-    return _send(f"settext|{hwnd}|{control_id}|{text}")
 
 
 @mcp.tool()
@@ -233,35 +260,19 @@ def control_click(hwnd: str, control_id: str = "") -> dict:
 
 @mcp.tool()
 def send_key(key: str) -> dict:
-    """
-    Send keystrokes to the active window. AutoIt Send() syntax.
-    Examples: '{ENTER}', '{TAB}', '1{TAB}password{ENTER}'.
-    Only works reliably inside a Wine virtual desktop (no focus stealing).
-    """
+    """Send keystrokes to active window (AutoIt Send syntax). Only reliable in virtual desktop."""
     return _send(f"key|{key}")
 
 
 @mcp.tool()
-def post_char(hwnd: str, char: str) -> dict:
-    """Post a single WM_CHAR to a window HWND without focus/activation."""
-    return _send(f"postchar|{hwnd}|{char}")
-
-
-@mcp.tool()
-def post_key(hwnd: str, vkcode: int) -> dict:
-    """Post WM_KEYDOWN+KEYUP for a virtual key code to a window HWND."""
-    return _send(f"postkey|{hwnd}|{vkcode}")
-
-
-@mcp.tool()
 def window_pos(hwnd: str) -> dict:
-    """Get position and size of a window: {x, y, w, h}."""
+    """Get window position and size: {x, y, w, h}."""
     return _send(f"winpos|{hwnd}")
 
 
 @mcp.tool()
 def list_screenshots() -> dict:
-    """List all screenshots captured by the bridge."""
+    """List all captured screenshots."""
     files = sorted(_glob.glob(str(BRIDGE_DIR / "screenshots" / "*.png")))
     return {"screenshots": files, "count": len(files)}
 
