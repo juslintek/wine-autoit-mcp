@@ -112,7 +112,52 @@ def screenshot() -> dict:
     Requires bridge and app to share the same virtual desktop (explorer /desktop=gotas).
     Returns the file path of the saved PNG inside the Wine prefix.
     """
-    return _send("screenshot")
+    result = _send("screenshot")
+    # Check if bridge screenshot is black (small file = black on macOS Wine)
+    if isinstance(result, dict) and result.get("ok"):
+        wine_path = result.get("file", "")
+        unix_path = os.path.join(WINEPREFIX, "drive_c", wine_path.replace("C:\\", "").replace("\\", "/"))
+        if os.path.exists(unix_path) and os.path.getsize(unix_path) < 10000:
+            # Likely black — use macOS native capture as fallback
+            host_result = _screenshot_host()
+            if host_result:
+                return host_result
+    return result
+
+
+def _screenshot_host() -> dict | None:
+    """Fallback: capture Wine window via macOS screencapture -l."""
+    import platform
+    if platform.system() != "Darwin":
+        return None
+    try:
+        # Find Wine window ID
+        find_cmd = """swift -e '
+let windows = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as! [[String: Any]]
+var best = 0; var bestH = 0
+for w in windows {
+    let owner = w["kCGWindowOwnerName"] as? String ?? ""
+    if owner == "wine" {
+        let bounds = w["kCGWindowBounds"] as? [String:Any] ?? [:]
+        let h = bounds["Height"] as? Int ?? 0
+        if h > bestH { bestH = h; best = w["kCGWindowNumber"] as? Int ?? 0 }
+    }
+}
+print(best)
+'"""
+        wid = subprocess.run(find_cmd, shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
+        if not wid or wid == "0":
+            return None
+        ts = time.strftime("%H%M%S")
+        out_path = os.path.join(BRIDGE_DIR, "screenshots", f"capture_{ts}.png")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        subprocess.run(["screencapture", "-l", wid, "-x", out_path], timeout=5)
+        if os.path.exists(out_path):
+            win_path = f"C:\\AutoIt3\\bridge\\screenshots\\capture_{ts}.png"
+            return {"ok": True, "file": win_path}
+    except Exception:
+        pass
+    return None
 
 
 @mcp.tool()
