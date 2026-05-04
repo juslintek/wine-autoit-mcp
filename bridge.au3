@@ -4,8 +4,6 @@
 ; Wine AutoIt Bridge - 20ms polling
 ; NOTE: WinActivate crashes Wine when targeting cross-process windows.
 ; All input uses PostMessage WM_CHAR/WM_KEYDOWN directly — no activation needed.
-; Run inside a named virtual desktop for screenshot to work:
-;   wine explorer /desktop=gotas,1024x768 AutoIt3.exe bridge.au3
 
 Global $g_sBridgeDir = "C:\AutoIt3\bridge\"
 Global $g_sCmdFile = $g_sBridgeDir & "command.json"
@@ -58,13 +56,14 @@ Func ExecuteCommand($sJson)
             Return '{"error":"need hwnd"}'
 
         Case "children"
+            ; List direct child HWNDs
             If $aParts[0] >= 2 Then
                 Local $hParent = HWnd($aParts[2])
                 Local $aResult[0]
-                Local $hChild = _GetWindow($hParent, 5)
+                Local $hChild = _GetWindow($hParent, 5) ; GW_CHILD
                 While $hChild <> 0
                     _ArrayAdd($aResult, $hChild)
-                    $hChild = _GetWindow($hChild, 2)
+                    $hChild = _GetWindow($hChild, 2) ; GW_HWNDNEXT
                 WEnd
                 Local $sResult = '{"children":['
                 For $i = 0 To UBound($aResult) - 1
@@ -77,40 +76,54 @@ Func ExecuteCommand($sJson)
             Return '{"error":"need hwnd"}'
 
         Case "login"
+            ; login|hwnd|userid|password
             ; Posts WM_CHAR directly to child textbox HWNDs — no WinActivate, no mouse
             If $aParts[0] >= 4 Then
                 Local $hWnd = HWnd($aParts[2])
                 Local $sUser = $aParts[3]
                 Local $sPass = $aParts[4]
+
+                ; Get child windows
                 Local $aChildren[0]
                 Local $hChild = _GetWindow($hWnd, 5)
                 While $hChild <> 0
                     _ArrayAdd($aChildren, $hChild)
                     $hChild = _GetWindow($hChild, 2)
                 WEnd
+
                 If UBound($aChildren) < 2 Then
                     Return '{"error":"expected 2+ child windows, got ' & UBound($aChildren) & '"}'
                 EndIf
+
+                ; Clear + type into first child (user ID field)
                 _PostClear($aChildren[0])
                 _PostChars($aChildren[0], $sUser)
                 Sleep(50)
+
+                ; Clear + type into second child (password field)
                 _PostClear($aChildren[1])
                 _PostChars($aChildren[1], $sPass)
                 Sleep(50)
+
+                ; Post Enter to the main window to submit
                 DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0100, "wparam", 0x0D, "lparam", 0)
                 DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0101, "wparam", 0x0D, "lparam", 0)
+
                 Return '{"ok":true,"children":' & UBound($aChildren) & '}'
             EndIf
             Return '{"error":"need hwnd, userid, password"}'
 
         Case "postchar"
+            ; postchar|hwnd|char — post single WM_CHAR to a window
             If $aParts[0] >= 3 Then
-                DllCall("user32.dll", "bool", "PostMessage", "handle", HWnd($aParts[2]), "uint", 0x0102, "wparam", Asc($aParts[3]), "lparam", 1)
+                Local $nChar = Asc($aParts[3])
+                DllCall("user32.dll", "bool", "PostMessage", "handle", HWnd($aParts[2]), "uint", 0x0102, "wparam", $nChar, "lparam", 1)
                 Return '{"ok":true}'
             EndIf
             Return '{"error":"need hwnd and char"}'
 
         Case "postkey"
+            ; postkey|hwnd|vkcode — post WM_KEYDOWN+KEYUP
             If $aParts[0] >= 3 Then
                 Local $hWnd = HWnd($aParts[2])
                 Local $nVK = Int($aParts[3])
@@ -191,6 +204,7 @@ Func ExecuteCommand($sJson)
     EndSwitch
 EndFunc
 
+; Post WM_CHAR for each character — no focus/activation needed
 Func _PostChars($hWnd, $sText)
     For $i = 1 To StringLen($sText)
         DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0102, "wparam", Asc(StringMid($sText, $i, 1)), "lparam", 1)
@@ -198,12 +212,13 @@ Func _PostChars($hWnd, $sText)
     Next
 EndFunc
 
+; Clear a field: post End key then 20 Backspaces
 Func _PostClear($hWnd)
-    DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0100, "wparam", 0x23, "lparam", 0)
+    DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0100, "wparam", 0x23, "lparam", 0) ; VK_END
     DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0101, "wparam", 0x23, "lparam", 0)
     Sleep(20)
     For $i = 1 To 20
-        DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0100, "wparam", 0x08, "lparam", 0)
+        DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0100, "wparam", 0x08, "lparam", 0) ; VK_BACK
         DllCall("user32.dll", "bool", "PostMessage", "handle", $hWnd, "uint", 0x0101, "wparam", 0x08, "lparam", 0)
         Sleep(5)
     Next
